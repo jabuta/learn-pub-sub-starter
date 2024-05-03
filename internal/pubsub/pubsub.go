@@ -1,17 +1,21 @@
 package pubsub
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"encoding/json"
+	"fmt"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-type QueueType int
+type AckType int
 
 const (
-	Durable QueueType = iota
-	Transient
+	Ack AckType = iota
+	NackRequeue
+	NackDiscard
 )
 
 func PublishJSON[T any](ch *amqp.Channel, exchange, key string, val T) error {
@@ -25,58 +29,120 @@ func PublishJSON[T any](ch *amqp.Channel, exchange, key string, val T) error {
 	})
 }
 
-func DeclareAndBind(
+func SubscribeJSON[T any](
 	conn *amqp.Connection,
 	exchange,
 	queueName,
 	key string,
-	simpleQueueType QueueType,
-) (*amqp.Channel, amqp.Queue, error) {
-	ch, err := conn.Channel()
-	if err != nil {
-		return nil, amqp.Queue{}, err
+	queueType QueueType,
+	handler func(T) AckType,
+) error {
+	unmarshaller := func(data []byte) (T, error) {
+		var target T
+		err := json.Unmarshal(data, &target)
+		return target, err
 	}
-	q, err := ch.QueueDeclare(
+	return subscribe(
+		conn,
+		exchange,
 		queueName,
-		simpleQueueType.durable(),
-		simpleQueueType.autoDelete(),
-		simpleQueueType.exclusive(),
+		key,
+		queueType,
+		handler,
+		unmarshaller,
+	)
+}
+
+func SubscribeGob[T any](
+	conn *amqp.Connection,
+	exchange,
+	queueName,
+	key string,
+	queueType QueueType,
+	handler func(T) AckType,
+) error {
+	unmarshaller := func(data []byte) (T, error) {
+		var target T
+		dec := gob.NewDecoder(bytes.NewBuffer(data))
+		err := dec.Decode(&target)
+		return target, err
+	}
+	return subscribe(
+		conn,
+		exchange,
+		queueName,
+		key,
+		queueType,
+		handler,
+		unmarshaller,
+	)
+}
+
+func subscribe[T any](
+	conn *amqp.Connection,
+	exchange,
+	queueName,
+	key string,
+	queueType QueueType,
+	handler func(T) AckType,
+	unmarshaller func([]byte) (T, error),
+) error {
+	ch, _, err := DeclareAndBind(
+		conn,
+		exchange,
+		queueName,
+		key,
+		queueType,
+	)
+	if err != nil {
+		return err
+	}
+	ch.Qos(10, 0, false)
+	delch, err := ch.Consume(
+		queueName,
+		"",
+		false,
+		false,
+		false,
 		false,
 		nil,
 	)
 	if err != nil {
-		return nil, amqp.Queue{}, err
+		return err
 	}
-	if err := ch.QueueBind(queueName, key, exchange, false, nil); err != nil {
-		return nil, amqp.Queue{}, err
-	}
-	return ch, q, nil
+
+	go func() {
+		defer ch.Close()
+		for msg := range delch {
+			target, err := unmarshaller(msg.Body)
+			if err != nil {
+				fmt.Println("Couldnt unmarshall message: ", err)
+			}
+			switch handler(target) {
+			case Ack:
+				// fmt.Println("Ack")
+				msg.Ack(false)
+			case NackRequeue:
+				// fmt.Println("NackR")
+				msg.Nack(false, true)
+			case NackDiscard:
+				// fmt.Println("NackD")
+				msg.Nack(false, false)
+			}
+		}
+	}()
+
+	return nil
 }
 
-func (q QueueType) durable() bool {
-	switch q {
-	case Durable:
-		return true
-	case Transient:
-		return false
+func PublishGob[T any](ch *amqp.Channel, exchange, key string, val T) error {
+	valb := new(bytes.Buffer)
+	enc := gob.NewEncoder(valb)
+	if err := enc.Encode(val); err != nil {
+		return err
 	}
-	return false
-}
-func (q QueueType) autoDelete() bool {
-	switch q {
-	case Durable:
-		return false
-	case Transient:
-		return true
-	}
-	return false
-}
-func (q QueueType) exclusive() bool {
-	switch q {
-	case Durable:
-		return false
-	case Transient:
-		return true
-	}
-	return false
+	return ch.PublishWithContext(context.Background(), exchange, key, false, false, amqp.Publishing{
+		ContentType: "application/gob",
+		Body:        valb.Bytes(),
+	})
 }
